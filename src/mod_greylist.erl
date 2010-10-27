@@ -4,6 +4,36 @@
 %%% Purpose : Keep track of temporarly, automatically banned hosts
 %%% Created : 23 Oct 2010 by Jonas Ådahl <jadahl@gmail.com>
 %%%
+%%%----------------------------------------------------------------------
+
+%%% @doc Keep track of temporarly, automatically banned hosts.
+%%%
+%%% Matches the username of failed login attempts to a list of patterns.
+%%% Possible use case is when your server is attacked by a botnet where it
+%%% would reduce load and network traffic. The side affect is that regular
+%%% users could possibly be temporarly banned if their computer or any
+%%% computer connecting from the same IP address are under control by the
+%%% botnet controller.
+%%%
+%%% Available options are:
+%%%   patterns      - a list of regular expressions
+%%%   cleanup_timer - timeout interval value (in seconds) for when cleanup
+%%%                   of expired greylist entries are to be triggered.
+%%%
+%%% Example:
+%%%  - Checks for and removes expired entries every 10 minutes.
+%%%  - User who failed to login to account ^bad_user_[0-9]{5,}$ (matches
+%%%    for example bad_user_3425523 and bad_user_12345 but not
+%%%    not_bad_user_153532.
+%%%
+%%% {modules, [
+%%%            {mod_greylist,  [
+%%%                             {cleanup_timeout, 600},
+%%%                             {patterns, ["^bad_user_[0-9]{5,}$"]}
+%%%                            ]
+%%%            }
+%%%           ]
+%%%
 
 -module(mod_greylist).
 -author('jadahl@gmail.com').
@@ -31,8 +61,8 @@
 -include("ejabberd.hrl").
 
 -define(PROCNAME, ?MODULE).
--define(GREYLIST_CLEANUP_TIMEOUT_SECS, 60 * 10). % 10 minutes
--define(GREYLIST_TIMEOUT_SECS, 60 * 60 * 5). % 5 hours
+-define(DEFAULT_CLEANUP_TIMEOUT_SECS, 60 * 10). % 10 minutes
+-define(DEFAULT_GREYLIST_TIMEOUT_SECS, 60 * 60 * 5). % 5 hours
 
 -record(greylist, {
         ipt,     % IP in tuple format
@@ -88,9 +118,10 @@ init([Host, Opts]) ->
     ejabberd_hooks:add(check_bl_c2s, ?MODULE, is_ip_greylisted, 75),
 
     try
-        case lists:keysearch(patterns, 1, Opts) of
+        % Required configuration
+        CompiledPatterns = case lists:keysearch(patterns, 1, Opts) of
             {value, {patterns, [_ | _] = Patterns}} ->
-                Compiled = [
+                [
                     case re:compile(P) of
                         {ok, R} -> R;
                         _ ->
@@ -98,24 +129,35 @@ init([Host, Opts]) ->
                     end
                     ||
                     P <- Patterns
-                ],
-
-                {ok, Timer} = timer:send_interval(timer:seconds(?GREYLIST_CLEANUP_TIMEOUT_SECS), cleanup_timer),
-
-                State = #state{
-                    match_patterns = Compiled,
-                    cleanup_timer = Timer,
-                    host = Host
-                },
-                {ok, State};
+                ];
             _ ->
                 ?ERROR_MSG("Didn't provide any match patterns to mod_greylist.", []),
-                {stop, {error, no_match_patterns}}
-        end
+                throw({error, no_match_patterns})
+        end,
+
+        % Optional configuration
+        CleanupTimeout = maybe_configured(cleanup_timeout, ?DEFAULT_CLEANUP_TIMEOUT_SECS, Opts),
+
+        {ok, Timer} = timer:send_interval(timer:seconds(CleanupTimeout), cleanup_timer),
+
+        State = #state{
+            match_patterns = CompiledPatterns,
+            cleanup_timer = Timer,
+            host = Host
+        },
+        {ok, State}
     catch
         {error, invalid_regexp, Pattern2} ->
             ?ERROR_MSG("Failed to compile regular expression ~w", [Pattern2]),
             {stop, {error, invalid_regexp}}
+    end.
+
+maybe_configured(Opt, Default, Opts) ->
+    case lists:keysearch(Opt, 1, Opts) of
+        {value, {_, Configured}} ->
+            Configured;
+        _ ->
+            Default
     end.
 
 handle_call({match, Username}, _From, #state{match_patterns = Patterns} = State) ->
@@ -224,7 +266,7 @@ is_ip_greylisted(_, IPT) ->
 %
 
 add_greylist(IPT) ->
-    Expires = now_to_seconds(now()) + ?GREYLIST_TIMEOUT_SECS,
+    Expires = now_to_seconds(now()) + ?DEFAULT_GREYLIST_TIMEOUT_SECS,
     mnesia:dirty_write(#greylist{ipt = IPT, expires = Expires}).
 
 is_greylisted(IPT) ->
