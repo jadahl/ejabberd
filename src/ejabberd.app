@@ -72,6 +72,7 @@
 	     mod_configure,
 	     mod_disco,
 	     mod_echo,
+	     mod_greylist,
 	     mod_http_bind,
 	     mod_http_fileserver,
 	     mod_irc,

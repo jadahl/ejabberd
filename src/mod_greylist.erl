@@ -1,0 +1,253 @@
+%%%----------------------------------------------------------------------
+%%% File    : mod_greylist.erl
+%%% Author  : Jonas Ådahl <jadahl@gmail.com>
+%%% Purpose : Keep track of temporarly, automatically banned hosts
+%%% Created : 23 Oct 2010 by Jonas Ådahl <jadahl@gmail.com>
+%%%
+
+-module(mod_greylist).
+-author('jadahl@gmail.com').
+
+-behaviour(gen_mod).
+-behaviour(gen_server).
+
+-export([
+        % gen_mod
+        start/2, start_link/2, stop/1,
+
+        % gen_server
+        init/1,
+        handle_call/3, handle_cast/2, handle_info/2,
+        terminate/2, code_change/3,
+
+        % api
+        add_greylist/1, is_greylisted/1,
+
+        % hooks
+        user_auth_failed/4,
+        is_ip_greylisted/2
+    ]).
+
+-include("ejabberd.hrl").
+
+-define(PROCNAME, ?MODULE).
+-define(GREYLIST_CLEANUP_TIMEOUT_SECS, 60 * 10). % 10 minutes
+-define(GREYLIST_TIMEOUT_SECS, 60 * 60 * 5). % 5 hours
+
+-record(greylist, {
+        ipt,     % IP in tuple format
+        expires  % expiration time in seconds
+    }).
+
+-record(state, {
+        match_patterns,
+        host,
+        cleanup_timer
+    }).
+
+start_link(Host, Opts) ->
+    gen_server:start_link({local, ?PROCNAME}, ?MODULE, [Host, Opts], []).
+
+start(Host, Opts) ->
+    case whereis(?PROCNAME) of
+        undefined ->
+            mnesia:create_table(greylist,[
+                    {disc_copies, [node()]},
+                    {attributes, record_info(fields, greylist)}
+                ]),
+            update_table(),
+            ChildSpec = {
+                ?PROCNAME,
+                {?MODULE, start_link, [Host, Opts]},
+                transient,
+                1000,
+                worker,
+                [?MODULE]
+            },
+            supervisor:start_child(ejabberd_sup, ChildSpec);
+        _ ->
+            ok
+    end.
+
+stop(_Host) ->
+    case whereis(?PROCNAME) of
+        undefined ->
+            ok;
+        _ ->
+            gen_server:call(?PROCNAME, stop),
+            supervisor:terminate_child(ejabberd_sup, ?PROCNAME),
+            supervisor:delete_child(ejabberd_sup, ?PROCNAME)
+    end.
+
+%
+% gen_server
+%
+
+init([Host, Opts]) ->
+    ejabberd_hooks:add(user_auth_failed, ?MODULE, user_auth_failed, 40),
+    ejabberd_hooks:add(check_bl_c2s, ?MODULE, is_ip_greylisted, 75),
+
+    try
+        case lists:keysearch(patterns, 1, Opts) of
+            {value, {patterns, [_ | _] = Patterns}} ->
+                Compiled = [
+                    case re:compile(P) of
+                        {ok, R} -> R;
+                        _ ->
+                            throw({error, invalid_regexp, P})
+                    end
+                    ||
+                    P <- Patterns
+                ],
+
+                {ok, Timer} = timer:send_interval(timer:seconds(?GREYLIST_CLEANUP_TIMEOUT_SECS), cleanup_timer),
+
+                State = #state{
+                    match_patterns = Compiled,
+                    cleanup_timer = Timer,
+                    host = Host
+                },
+                {ok, State};
+            _ ->
+                ?ERROR_MSG("Didn't provide any match patterns to mod_greylist.", []),
+                {stop, {error, no_match_patterns}}
+        end
+    catch
+        {error, invalid_regexp, Pattern2} ->
+            ?ERROR_MSG("Failed to compile regular expression ~w", [Pattern2]),
+            {stop, {error, invalid_regexp}}
+    end.
+
+handle_call({match, Username}, _From, #state{match_patterns = Patterns} = State) ->
+    Res = lists:any(fun(Pattern) ->
+                        case re:run(Username, Pattern) of
+                            {match, _} -> true;
+                            _ -> false
+                        end
+                    end, Patterns),
+    Reply = if Res -> match; true -> no_match end,
+    {reply, Reply, State};
+handle_call(stop, _From, State) ->
+    {stop, normal, ok, State};
+handle_call(_Req, _From, State) ->
+    {reply, {error, badarg}, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(cleanup_timer, State) ->
+    cleanup_expired(),
+    {noreply, State};
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, #state{cleanup_timer = Timer}) ->
+    timer:cancel(Timer),
+    ejabberd_hooks:delete(user_auth_failed, ?MODULE, user_auth_failed, 40),
+    ejabberd_hooks:add(check_bl_c2s, ?MODULE, is_ip_greylisted, 75),
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    update_table(),
+    {ok, State}.
+
+update_table() ->
+    Fields = record_info(fields, greylist),
+    case mnesia:table_info(greylist, attributes) of
+        Fields ->
+            ok;
+        _ ->
+            ?INFO_MSG("Recreating greylist table",[]),
+            mnesia:transform_table(greylist, ignore, Fields)
+    end.
+
+cleanup_expired() ->
+    Now = now_to_seconds(now()),
+    F = fun() ->
+            mnesia:write_lock_table(greylist),
+            mnesia:foldl(
+                fun(#greylist{expires = Expires} = R, N) ->
+                    if
+                        Now >= Expires ->
+                            mnesia:delete_object(R),
+                            N + 1;
+                        true ->
+                            N
+                    end
+                end, 0, greylist)
+        end,
+
+    case mnesia:transaction(F) of
+        {atomic, Num} ->
+            if
+                Num > 0 ->
+                    ?ERROR_MSG("Cleaned up ~w expired greylist entries.", [Num]);
+                true ->
+                    ok
+            end;
+        _Error ->
+            ?ERROR_MSG("Couldn't clean up expired entries: ~w", [_Error])
+    end.
+
+now_to_seconds({MegaSecs, Secs, _MicroSecs}) ->
+    (MegaSecs * 1000000) + Secs.
+
+%
+% Hooks
+%
+
+user_auth_failed(In, Username, _Host, IP) ->
+    case gen_server:call(?PROCNAME, {match, Username}) of
+        match ->
+            {IPT, _Port} = IP,
+            ?INFO_MSG("Abusive user discovered connecting from ~w. Adding ~w to greylist.", [IP, IPT]),
+            add_greylist(IPT),
+            In;
+        no_match ->
+            In;
+        _Error ->
+            ?INFO_MSG("Error: ~w", [_Error]),
+            In
+    end.
+
+is_ip_greylisted(true, _) -> true;
+is_ip_greylisted(_, IPT) ->
+    case is_greylisted(IPT) of
+        true ->
+            true;
+        _Res ->
+            false
+    end.
+
+%
+% API
+%
+
+add_greylist(IPT) ->
+    Expires = now_to_seconds(now()) + ?GREYLIST_TIMEOUT_SECS,
+    mnesia:dirty_write(#greylist{ipt = IPT, expires = Expires}).
+
+is_greylisted(IPT) ->
+    SecsNow = now_to_seconds(now()),
+    F = fun() ->
+            case mnesia:read(greylist, IPT) of
+                [Entry] ->
+                    Expires = Entry#greylist.expires,
+                    if
+                        Expires > SecsNow ->
+                            true;
+                        true ->
+                            mnesia:delete_object(Entry),
+                            false
+                    end;
+                [] ->
+                    false
+            end
+        end,
+    case mnesia:transaction(F) of
+        {atomic, Res} ->
+            Res;
+        Error ->
+            {error, Error}
+    end.
+

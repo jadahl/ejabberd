@@ -595,10 +595,12 @@ wait_for_feature_request({xmlstreamelement, El}, StateData) ->
 				   StateData#state{
 				     sasl_state = NewSASLState});
 		{error, Error, Username} ->
+		    Host = StateData#state.server,
 		    ?INFO_MSG(
 		       "(~w) Failed authentication for ~s@~s",
 		       [StateData#state.socket,
-			Username, StateData#state.server]),
+			Username, Host]),
+		    ejabberd_hooks:run_fold(user_auth_failed, global, ok, [Username, Host, StateData#state.ip]),
 		    send_element(StateData,
 				 {xmlelement, "failure",
 				  [{"xmlns", ?NS_SASL}],
