@@ -16,12 +16,16 @@
 %%% botnet controller.
 %%%
 %%% Available options are:
-%%%   patterns      - a list of regular expressions
-%%%   cleanup_timer - timeout interval value (in seconds) for when cleanup
-%%%                   of expired greylist entries are to be triggered.
+%%%   patterns       - A list of regular expressions
+%%%   cleanup_timer  - Timeout interval value (in seconds) for when
+%%%                    cleanup of expired greylist entries are to be
+%%%                    triggered.
+%%%   expire_timeout - Timeout value (in seconds) for how long an IP is to
+%%%                    be banned.
 %%%
 %%% Example:
 %%%  - Checks for and removes expired entries every 10 minutes.
+%%%  - A banned IP will stay banned for 4 hours.
 %%%  - User who failed to login to account ^bad_user_[0-9]{5,}$ (matches
 %%%    for example bad_user_3425523 and bad_user_12345 but not
 %%%    not_bad_user_153532.
@@ -29,6 +33,7 @@
 %%% {modules, [
 %%%            {mod_greylist,  [
 %%%                             {cleanup_timeout, 600},
+%%%                             {expire_timeout, 14400},
 %%%                             {patterns, ["^bad_user_[0-9]{5,}$"]}
 %%%                            ]
 %%%            }
@@ -72,7 +77,8 @@
 -record(state, {
         match_patterns,
         host,
-        cleanup_timer
+        cleanup_timer,
+        expire_timeout
     }).
 
 start_link(Host, Opts) ->
@@ -137,13 +143,15 @@ init([Host, Opts]) ->
 
         % Optional configuration
         CleanupTimeout = maybe_configured(cleanup_timeout, ?DEFAULT_CLEANUP_TIMEOUT_SECS, Opts),
+        ExpireTimeout = maybe_configured(expire_timeout, ?DEFAULT_GREYLIST_TIMEOUT_SECS, Opts),
 
         {ok, Timer} = timer:send_interval(timer:seconds(CleanupTimeout), cleanup_timer),
 
         State = #state{
             match_patterns = CompiledPatterns,
+            host = Host,
             cleanup_timer = Timer,
-            host = Host
+            expire_timeout = ExpireTimeout
         },
         {ok, State}
     catch
@@ -169,6 +177,8 @@ handle_call({match, Username}, _From, #state{match_patterns = Patterns} = State)
                     end, Patterns),
     Reply = if Res -> match; true -> no_match end,
     {reply, Reply, State};
+handle_call(expire_timeout, _From, #state{expire_timeout = ExpireTimeout} = State) ->
+    {reply, {ok, ExpireTimeout}, State};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 handle_call(_Req, _From, State) ->
@@ -266,7 +276,14 @@ is_ip_greylisted(_, IPT) ->
 %
 
 add_greylist(IPT) ->
-    Expires = now_to_seconds(now()) + ?DEFAULT_GREYLIST_TIMEOUT_SECS,
+    ExpireTimeout = case gen_server:call(?PROCNAME, expire_timeout) of
+        {ok, Value} ->
+            Value;
+        _Error ->
+            ?ERROR_MSG("Couldn't get expire timeout: ~w. Using default.", [_Error]),
+            ?DEFAULT_GREYLIST_TIMEOUT_SECS
+    end,
+    Expires = now_to_seconds(now()) + ExpireTimeout,
     mnesia:dirty_write(#greylist{ipt = IPT, expires = Expires}).
 
 is_greylisted(IPT) ->
