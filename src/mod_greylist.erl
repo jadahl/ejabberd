@@ -196,7 +196,7 @@ handle_info(_Info, State) ->
 terminate(_Reason, #state{cleanup_timer = Timer}) ->
     timer:cancel(Timer),
     ejabberd_hooks:delete(user_auth_failed, ?MODULE, user_auth_failed, 40),
-    ejabberd_hooks:add(check_bl_c2s, ?MODULE, is_ip_greylisted, 75),
+    ejabberd_hooks:delete(check_bl_c2s, ?MODULE, is_ip_greylisted, 75),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -289,7 +289,7 @@ add_greylist(IPT) ->
 is_greylisted(IPT) ->
     SecsNow = now_to_seconds(now()),
     F = fun() ->
-            case mnesia:read(greylist, IPT) of
+            case mnesia:read({greylist, IPT}) of
                 [Entry] ->
                     Expires = Entry#greylist.expires,
                     if
